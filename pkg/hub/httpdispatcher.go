@@ -667,6 +667,7 @@ func (d *HTTPAgentDispatcher) DispatchAgentProvision(ctx context.Context, agent 
 // If the broker returns 202 with env requirements, it returns the requirements
 // as the first value instead of an error.
 func (d *HTTPAgentDispatcher) DispatchAgentCreateWithGather(ctx context.Context, agent *store.Agent) (*RemoteEnvRequirementsResponse, error) {
+	dispatchStart := time.Now()
 	if err := requireRuntimeBrokerAssigned(agent); err != nil {
 		return nil, err
 	}
@@ -685,7 +686,15 @@ func (d *HTTPAgentDispatcher) DispatchAgentCreateWithGather(ctx context.Context,
 	// Track which scope provided each key
 	req.EnvSources = d.buildEnvSources(ctx, agent, req.ResolvedEnv)
 
+	d.log.Info("Dispatcher: request built, sending to broker",
+		"agent_id", agent.ID, "agent", agent.Name,
+		"broker", agent.RuntimeBrokerID, "buildElapsed", time.Since(dispatchStart).String())
+	brokerCallStart := time.Now()
 	resp, envReqs, err := d.client.CreateAgentWithGather(ctx, agent.RuntimeBrokerID, endpoint, req)
+	d.log.Info("Dispatcher: broker responded",
+		"agent_id", agent.ID, "agent", agent.Name,
+		"brokerElapsed", time.Since(brokerCallStart).String(),
+		"totalElapsed", time.Since(dispatchStart).String())
 	if err != nil {
 		return nil, err
 	}

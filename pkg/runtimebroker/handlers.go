@@ -294,6 +294,7 @@ func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	createStart := time.Now()
 
 	var req CreateAgentRequest
 	if err := readJSON(r, &req); err != nil {
@@ -558,6 +559,9 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build unified start context (grove path, env, template, git-clone, secrets, manager)
+	s.agentLifecycleLog.Info("Agent dispatch: pre-flight complete",
+		"agent_id", req.ID, "name", req.Name, "elapsed", time.Since(createStart).String())
+	buildCtxStart := time.Now()
 	sc, err := s.buildStartContext(ctx, startContextInputs{
 		Name:            req.Name,
 		AgentID:         req.ID,
@@ -590,6 +594,8 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	opts := sc.Opts
+	s.agentLifecycleLog.Info("Agent dispatch: buildStartContext complete",
+		"agent_id", req.ID, "name", req.Name, "elapsed", time.Since(buildCtxStart).String())
 
 	// If WorkspaceStoragePath is set, download workspace from GCS (non-git bootstrap)
 	if req.WorkspaceStoragePath != "" {
@@ -656,6 +662,7 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Branch based on provision-only flag
+	startOpStart := time.Now()
 	if req.ProvisionOnly {
 		// Provision only: set up dirs, worktree, templates without starting the container
 		cfg, err := sc.Manager.Provision(ctx, opts)
@@ -723,6 +730,10 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.agentLifecycleLog.Info("Agent dispatch: start complete",
+		"agent_id", req.ID, "name", req.Name,
+		"startElapsed", time.Since(startOpStart).String(),
+		"totalElapsed", time.Since(createStart).String())
 	s.agentLifecycleLog.Info("Agent created",
 		"agent_id", req.ID, "grove_id", req.ProjectID,
 		"name", req.Name, "slug", req.Slug,

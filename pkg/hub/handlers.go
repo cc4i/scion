@@ -470,6 +470,7 @@ func (s *Server) createAgentInProject(
 	notifySubscriberID string,
 ) {
 	ctx := r.Context()
+	hubCreateStart := time.Now()
 
 	// Verify project exists and get its configuration
 	project, err := s.store.GetProject(ctx, projectID)
@@ -812,6 +813,8 @@ func (s *Server) createAgentInProject(
 	// Dispatch to runtime broker if available.
 	// Unless provision-only is requested, do a full create+start via DispatchAgentCreate.
 	// Otherwise provision only — set up dirs, worktree, templates without launching the container.
+	s.agentLifecycleLog.Info("Hub: pre-dispatch setup complete",
+		"agent_id", agent.ID, "agent", agent.Name, "elapsed", time.Since(hubCreateStart).String())
 	var warnings []string
 	if dispatcher := s.GetDispatcher(); dispatcher != nil {
 		if !req.ProvisionOnly {
@@ -896,6 +899,9 @@ func (s *Server) createAgentInProject(
 			}
 		}
 	}
+
+	s.agentLifecycleLog.Info("Hub: dispatch complete",
+		"agent_id", agent.ID, "agent", agent.Name, "totalElapsed", time.Since(hubCreateStart).String())
 
 	// Re-read the agent from the database before publishing the "created" event.
 	// A concurrent status update (e.g. sciontool reporting a clone error) may have
