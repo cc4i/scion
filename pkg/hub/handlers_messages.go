@@ -189,9 +189,15 @@ func (s *Server) handleAgentMessages(w http.ResponseWriter, r *http.Request, age
 		opts.Cursor = cursor
 	}
 
+	// Users who can manage the agent (owners, project admins, global admins)
+	// see all messages including those from chat integrations. Other users
+	// only see messages where they are a participant, preserving privacy.
 	filter := store.MessageFilter{
-		AgentID:       agentID,
-		ParticipantID: user.ID(),
+		AgentID: agentID,
+	}
+	canManage := s.authzService.CheckAccess(ctx, user, agentResource(agent), ActionManage)
+	if !canManage.Allowed {
+		filter.ParticipantID = user.ID()
 	}
 
 	result, err := s.store.ListMessages(ctx, filter, opts)
@@ -269,7 +275,12 @@ func (s *Server) handleAgentMessagesStream(w http.ResponseWriter, r *http.Reques
 	ch, unsubscribe := ep.Subscribe("agent." + agent.ID + ".message")
 	defer unsubscribe()
 
+	// Users who can manage the agent see all messages; others only see
+	// messages where they are a participant.
 	userID := user.ID()
+	canManage := s.authzService.CheckAccess(ctx, user, agentResource(agent), ActionManage)
+	filterStream := !canManage.Allowed
+
 	heartbeat := time.NewTicker(30 * time.Second)
 	defer heartbeat.Stop()
 
@@ -284,15 +295,14 @@ func (s *Server) handleAgentMessagesStream(w http.ResponseWriter, r *http.Reques
 			if !ok {
 				return
 			}
-			// Filter: only forward events where the current user is a
-			// participant. Without this the stream would include messages
-			// from every other user's conversation with this agent.
-			var payload UserMessageEvent
-			if err := json.Unmarshal(evt.Data, &payload); err != nil {
-				continue
-			}
-			if payload.SenderID != userID && payload.RecipientID != userID {
-				continue
+			if filterStream {
+				var payload UserMessageEvent
+				if err := json.Unmarshal(evt.Data, &payload); err != nil {
+					continue
+				}
+				if payload.SenderID != userID && payload.RecipientID != userID {
+					continue
+				}
 			}
 			fmt.Fprintf(w, "event: message\ndata: %s\n\n", evt.Data)
 			flusher.Flush()
