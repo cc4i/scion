@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -18,11 +19,17 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	otelmetric "go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 	metricpb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/api/googleapi"
 )
+
+// metricFlushInterval is the minimum interval between metric exports to Cloud
+// Monitoring. This prevents sampling-rate violations when multiple short-lived
+// processes (hooks) send metrics in rapid succession.
+const metricFlushInterval = 15 * time.Second
 
 // Pipeline orchestrates the telemetry collection and forwarding.
 type Pipeline struct {
@@ -35,6 +42,17 @@ type Pipeline struct {
 	healthCancel context.CancelFunc
 	exportErrors otelmetric.Int64Counter
 	meter        otelmetric.Meter
+
+	metricsDropWarned sync.Once
+	logsDropWarned    sync.Once
+	spansDropWarned   sync.Once
+
+	metricBuf       []*metricpb.ResourceMetrics
+	metricBufMu     sync.Mutex
+	metricFlushCtx  context.Context
+	metricFlushCnl  context.CancelFunc
+	metricLastFlush time.Time
+	metricFlushWg   sync.WaitGroup
 }
 
 // New creates a new telemetry pipeline.
@@ -135,6 +153,16 @@ func (p *Pipeline) Start(ctx context.Context) error {
 
 	p.running = true
 
+	// Start metric flush goroutine for batching exports to Cloud Monitoring.
+	if p.exporter != nil {
+		p.metricFlushCtx, p.metricFlushCnl = context.WithCancel(ctx)
+		p.metricFlushWg.Add(1)
+		go func() {
+			defer p.metricFlushWg.Done()
+			p.metricFlushLoop()
+		}()
+	}
+
 	// Register pipeline health gauge and export error counter.
 	if p.config.IsCloudConfigured() && p.exporter != nil {
 		p.initSelfMetrics(ctx)
@@ -165,6 +193,14 @@ func (p *Pipeline) Stop(ctx context.Context) error {
 		p.healthCancel()
 		p.healthCancel = nil
 	}
+
+	// Stop metric flush goroutine and drain remaining buffered metrics.
+	if p.metricFlushCnl != nil {
+		p.metricFlushCnl()
+		p.metricFlushCnl = nil
+	}
+	p.metricFlushWg.Wait()
+	p.flushMetricBuffer(ctx, true)
 
 	// Stop receiver first
 	if p.receiver != nil {
@@ -231,6 +267,10 @@ func (p *Pipeline) handleSpans(ctx context.Context, resourceSpans []*tracepb.Res
 			return err
 		}
 		log.Debug("Exported %d spans to cloud", spanCount)
+	} else {
+		p.spansDropWarned.Do(func() {
+			log.Error("Received %d spans but cloud exporter is not configured — spans will be dropped. Set SCION_GCP_PROJECT_ID or configure telemetry.cloud", spanCount)
+		})
 	}
 
 	return nil
@@ -276,25 +316,229 @@ func (p *Pipeline) filterSpans(resourceSpans []*tracepb.ResourceSpans) []*tracep
 	return result
 }
 
-// handleMetrics processes incoming metrics from the receiver.
+// handleMetrics buffers incoming metrics for periodic export to Cloud Monitoring.
+// Metrics are accumulated and flushed at metricFlushInterval to avoid
+// sampling-rate violations from rapid writes (e.g. multiple hook processes).
 func (p *Pipeline) handleMetrics(ctx context.Context, resourceMetrics []*metricpb.ResourceMetrics) error {
 	if len(resourceMetrics) == 0 {
 		return nil
 	}
 
-	// Forward to cloud exporter if available. In GCP-native mode, OTLP metrics
-	// received by this pipeline are converted and forwarded to Cloud Monitoring.
-	// Sciontool's own SDK metrics may still bypass the pipeline and export
-	// directly via a MeterProvider.
 	if p.exporter != nil {
-		if err := p.exporter.ExportProtoMetrics(ctx, resourceMetrics); err != nil {
-			p.recordExportError(ctx, "metrics", err)
-			log.Error("Failed to export metrics to cloud: %v", err)
-			return err
+		p.metricBufMu.Lock()
+		p.metricBuf = append(p.metricBuf, resourceMetrics...)
+		p.metricBufMu.Unlock()
+		log.Debug("Buffered %d resource metric batches for export", len(resourceMetrics))
+	} else {
+		metricCount := 0
+		for _, rm := range resourceMetrics {
+			for _, sm := range rm.ScopeMetrics {
+				metricCount += len(sm.Metrics)
+			}
 		}
+		p.metricsDropWarned.Do(func() {
+			log.Error("Received %d metrics but cloud exporter is not configured — metrics will be dropped. Set SCION_GCP_PROJECT_ID or configure telemetry.cloud", metricCount)
+		})
 	}
 
 	return nil
+}
+
+// metricFlushLoop periodically flushes buffered metrics to Cloud Monitoring.
+func (p *Pipeline) metricFlushLoop() {
+	ticker := time.NewTicker(metricFlushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.metricFlushCtx.Done():
+			return
+		case <-ticker.C:
+			p.flushMetricBuffer(p.metricFlushCtx, false)
+		}
+	}
+}
+
+// flushMetricBuffer deduplicates and exports buffered metrics to Cloud Monitoring.
+// For cumulative metrics from short-lived hook processes, multiple data points may
+// exist for the same metric+attributes combination. Only the latest data point is
+// kept to avoid Cloud Monitoring sampling-rate violations.
+//
+// Cloud Monitoring requires a minimum 10-second interval between writes for the
+// same time series. This method enforces metricFlushInterval between exports to
+// prevent rapid consecutive flushes (e.g. periodic tick followed by shutdown drain)
+// from triggering sampling-rate rejections. Pass force=true during shutdown to
+// bypass the interval check and drain all remaining buffered metrics.
+func (p *Pipeline) flushMetricBuffer(ctx context.Context, force bool) {
+	p.metricBufMu.Lock()
+	buf := p.metricBuf
+	sinceLastFlush := time.Since(p.metricLastFlush)
+	if len(buf) > 0 && !force && sinceLastFlush < metricFlushInterval {
+		p.metricBufMu.Unlock()
+		log.Debug("Skipping metric flush — last export was %v ago (minimum %v)", sinceLastFlush.Round(time.Millisecond), metricFlushInterval)
+		return
+	}
+	p.metricBuf = nil
+	p.metricBufMu.Unlock()
+
+	if len(buf) == 0 || p.exporter == nil {
+		return
+	}
+
+	deduped := deduplicateMetrics(buf)
+
+	metricCount := 0
+	for _, rm := range deduped {
+		for _, sm := range rm.ScopeMetrics {
+			metricCount += len(sm.Metrics)
+		}
+	}
+
+	if err := p.exporter.ExportProtoMetrics(ctx, deduped); err != nil {
+		p.recordExportError(ctx, "metrics", err)
+		log.Error("Failed to export %d buffered metrics to cloud: %v", metricCount, err)
+		return
+	}
+	p.metricBufMu.Lock()
+	p.metricLastFlush = time.Now()
+	p.metricBufMu.Unlock()
+	log.Debug("Exported %d buffered metrics to cloud", metricCount)
+}
+
+// deduplicateMetrics merges multiple ResourceMetrics into one, keeping only the
+// latest data point per (metric name, attribute set) for Sum metrics. This
+// prevents Cloud Monitoring sampling-rate violations when multiple hook processes
+// report the same cumulative counter within a short window.
+func deduplicateMetrics(rms []*metricpb.ResourceMetrics) []*metricpb.ResourceMetrics {
+	if len(rms) <= 1 {
+		return rms
+	}
+
+	// Flatten all metrics into a single ResourceMetrics, deduplicating data points.
+	// Key: "scope/metricname" → Metric with deduplicated data points.
+	type metricKey struct {
+		scope  string
+		metric string
+	}
+	latest := make(map[metricKey]*metricpb.Metric)
+
+	var resource *metricpb.ResourceMetrics
+	for _, rm := range rms {
+		if rm == nil {
+			continue
+		}
+		if resource == nil {
+			resource = rm
+		}
+		for _, sm := range rm.ScopeMetrics {
+			scopeName := ""
+			if sm.Scope != nil {
+				scopeName = sm.Scope.Name
+			}
+			for _, m := range sm.Metrics {
+				key := metricKey{scope: scopeName, metric: m.Name}
+				existing, ok := latest[key]
+				if !ok {
+					latest[key] = m
+					continue
+				}
+				// For Sum metrics, keep only the data point with the latest timestamp
+				// per attribute set. For other types, keep the latest metric entirely.
+				merged := mergeMetricDataPoints(existing, m)
+				latest[key] = merged
+			}
+		}
+	}
+
+	if resource == nil || len(latest) == 0 {
+		return nil
+	}
+
+	// Rebuild scope→metrics structure.
+	scopeMetrics := make(map[string][]*metricpb.Metric)
+	for key, m := range latest {
+		scopeMetrics[key.scope] = append(scopeMetrics[key.scope], m)
+	}
+	sms := make([]*metricpb.ScopeMetrics, 0, len(scopeMetrics))
+	for _, metrics := range scopeMetrics {
+		sms = append(sms, &metricpb.ScopeMetrics{Metrics: metrics})
+	}
+	return []*metricpb.ResourceMetrics{{
+		Resource:     resource.Resource,
+		ScopeMetrics: sms,
+	}}
+}
+
+// mergeMetricDataPoints merges two proto metrics with the same name, keeping
+// the latest data point per attribute set for Sum types.
+func mergeMetricDataPoints(a, b *metricpb.Metric) *metricpb.Metric {
+	aSum, aOK := a.Data.(*metricpb.Metric_Sum)
+	bSum, bOK := b.Data.(*metricpb.Metric_Sum)
+	if !aOK || !bOK {
+		// For non-Sum metrics, keep the one with the latest timestamp
+		return b
+	}
+
+	// Dedup by attribute set: keep the data point with the latest TimeUnixNano.
+	type attrKey string
+	pointMap := make(map[attrKey]*metricpb.NumberDataPoint)
+	for _, dp := range aSum.Sum.DataPoints {
+		key := attrKey(attrSetKey(dp.Attributes))
+		pointMap[key] = dp
+	}
+	for _, dp := range bSum.Sum.DataPoints {
+		key := attrKey(attrSetKey(dp.Attributes))
+		existing, ok := pointMap[key]
+		if !ok || dp.TimeUnixNano > existing.TimeUnixNano {
+			pointMap[key] = dp
+		}
+	}
+
+	merged := make([]*metricpb.NumberDataPoint, 0, len(pointMap))
+	for _, dp := range pointMap {
+		merged = append(merged, dp)
+	}
+	return &metricpb.Metric{
+		Name:        a.Name,
+		Description: a.Description,
+		Unit:        a.Unit,
+		Data: &metricpb.Metric_Sum{
+			Sum: &metricpb.Sum{
+				DataPoints:             merged,
+				AggregationTemporality: aSum.Sum.AggregationTemporality,
+				IsMonotonic:            aSum.Sum.IsMonotonic,
+			},
+		},
+	}
+}
+
+// attrSetKey creates a stable string key from a list of proto attributes.
+// Attributes are copied and sorted by key to ensure a stable, order-independent key.
+func attrSetKey(attrs []*commonpb.KeyValue) string {
+	if len(attrs) == 0 {
+		return ""
+	}
+	sorted := make([]*commonpb.KeyValue, len(attrs))
+	copy(sorted, attrs)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Key < sorted[j].Key
+	})
+
+	var b strings.Builder
+	for i, kv := range sorted {
+		if i > 0 {
+			b.WriteByte(';')
+		}
+		b.WriteString(kv.Key)
+		b.WriteByte('=')
+		if kv.Value != nil {
+			if sv := kv.Value.GetStringValue(); sv != "" {
+				b.WriteString(sv)
+			} else if iv := kv.Value.GetIntValue(); iv != 0 {
+				fmt.Fprintf(&b, "%d", iv)
+			}
+		}
+	}
+	return b.String()
 }
 
 // handleLogs processes incoming logs from the receiver.
@@ -319,6 +563,10 @@ func (p *Pipeline) handleLogs(ctx context.Context, resourceLogs []*logspb.Resour
 			return err
 		}
 		log.Debug("Exported %d log records to cloud", logCount)
+	} else {
+		p.logsDropWarned.Do(func() {
+			log.Error("Received %d log records but cloud exporter is not configured — logs will be dropped. Set SCION_GCP_PROJECT_ID or configure telemetry.cloud", logCount)
+		})
 	}
 
 	return nil

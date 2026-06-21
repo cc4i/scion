@@ -4976,6 +4976,20 @@ func (s *Server) handleProjectRoutes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check for nested /metrics-summary path (lightweight project metrics summary)
+	if subPath == "metrics-summary" {
+		s.handleProjectMetricsSummary(w, r, projectID)
+		return
+	}
+
+	// Check for nested /metrics path (project-scoped metrics dashboard)
+	if subPath == "metrics" || strings.HasPrefix(subPath, "metrics/") {
+		metricsPath := strings.TrimPrefix(subPath, "metrics")
+		metricsPath = strings.TrimPrefix(metricsPath, "/")
+		s.handleProjectMetricsDashboard(w, r, projectID, metricsPath)
+		return
+	}
+
 	// Check for nested /settings path
 	if subPath == "settings" {
 		s.handleProjectSettings(w, r, projectID)
