@@ -60,7 +60,7 @@ func HandleModalSubmit(
 	s *discordgo.Session,
 	i *discordgo.InteractionCreate,
 	store Store,
-	deliverInbound func(topic string, msg *messages.StructuredMessage),
+	deliverInbound func(topic string, msg *messages.StructuredMessage) *hubError,
 	log *slog.Logger,
 ) {
 	if log == nil {
@@ -136,7 +136,10 @@ func HandleModalSubmit(
 			},
 		}
 
-		deliverInbound(topic, msg)
+		if he := deliverInbound(topic, msg); he != nil {
+			respondEphemeral(s, i, he.userFacingMessage())
+			return
+		}
 	}
 
 	// Mark as responded.
