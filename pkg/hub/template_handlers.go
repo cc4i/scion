@@ -16,6 +16,7 @@ package hub
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -351,6 +352,8 @@ func (s *Server) handleTemplateByIDV2(w http.ResponseWriter, r *http.Request) {
 		s.handleTemplateDownload(w, r, templateID)
 	case "clone":
 		s.handleTemplateClone(w, r, templateID)
+	case "validate":
+		s.handleTemplateValidate(w, r, templateID)
 	case "files":
 		s.handleTemplateFiles(w, r, templateID, "")
 	default:
@@ -689,7 +692,11 @@ func (s *Server) handleTemplateDownload(w http.ResponseWriter, r *http.Request, 
 	}
 
 	// Generate download URLs using shared helper
-	downloadURLs, manifestURL, expires, _ := generateDownloadURLs(ctx, stor, template.StoragePath, template.Files)
+	downloadURLs, manifestURL, expires, err := generateDownloadURLs(ctx, stor, template.StoragePath, template.Files)
+	if err != nil {
+		RuntimeError(w, fmt.Sprintf("template %q: %s — run 'scion template validate %s' to diagnose", template.Name, err, template.Name))
+		return
+	}
 
 	// For local storage, rewrite file:// URLs to HTTP proxy URLs
 	if stor.Provider() == storage.ProviderLocal {
@@ -704,6 +711,31 @@ func (s *Server) handleTemplateDownload(w http.ResponseWriter, r *http.Request, 
 	}
 
 	writeJSON(w, http.StatusOK, response)
+}
+
+// handleTemplateValidate validates a template's storage consistency.
+func (s *Server) handleTemplateValidate(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		MethodNotAllowed(w)
+		return
+	}
+
+	ctx := r.Context()
+	template, err := s.store.GetTemplate(ctx, id)
+	if err != nil {
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	rec := templateToRecord(template)
+	rs := s.templateStore()
+	report, err := rs.ValidateStorage(ctx, rec)
+	if err != nil {
+		RuntimeError(w, fmt.Sprintf("validation failed: %v", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, report)
 }
 
 // handleTemplateClone creates a copy of a template.

@@ -15,6 +15,7 @@
 package hub
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -239,6 +240,8 @@ func (s *Server) handleHarnessConfigByID(w http.ResponseWriter, r *http.Request)
 		s.handleHarnessConfigDownload(w, r, hcID)
 	case "clone":
 		s.handleHarnessConfigClone(w, r, hcID)
+	case "validate":
+		s.handleHarnessConfigValidate(w, r, hcID)
 	case "reimport":
 		s.handleHarnessConfigReimport(w, r, hcID)
 	case "files":
@@ -574,13 +577,42 @@ func (s *Server) handleHarnessConfigDownload(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	downloadURLs, manifestURL, expires, _ := generateDownloadURLs(ctx, stor, hc.StoragePath, hc.Files)
+	downloadURLs, manifestURL, expires, err := generateDownloadURLs(ctx, stor, hc.StoragePath, hc.Files)
+	if err != nil {
+		RuntimeError(w, fmt.Sprintf("harness-config %q: %s — run 'scion harness-config validate %s' to diagnose", hc.Name, err, hc.Name))
+		return
+	}
 
 	writeJSON(w, http.StatusOK, DownloadResponse{
 		Files:       downloadURLs,
 		ManifestURL: manifestURL,
 		Expires:     expires,
 	})
+}
+
+// handleHarnessConfigValidate validates a harness-config's storage consistency.
+func (s *Server) handleHarnessConfigValidate(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		MethodNotAllowed(w)
+		return
+	}
+
+	ctx := r.Context()
+	hc, err := s.store.GetHarnessConfig(ctx, id)
+	if err != nil {
+		writeErrorFromErr(w, err, "")
+		return
+	}
+
+	rec := harnessConfigToRecord(hc)
+	rs := s.harnessConfigStore(hc.Harness)
+	report, err := rs.ValidateStorage(ctx, rec)
+	if err != nil {
+		RuntimeError(w, fmt.Sprintf("validation failed: %v", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, report)
 }
 
 // handleHarnessConfigClone creates a copy of a harness config.
