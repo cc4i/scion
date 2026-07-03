@@ -15,7 +15,7 @@
   },
   "model": {
     "skipNextSpeakerCheck": true,
-    "name": "gemini-3-flash-preview"
+    "name": "gemini-3.5-flash"
   },
   "telemetry": {
     "enabled": true
