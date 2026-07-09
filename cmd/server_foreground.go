@@ -215,19 +215,11 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 	// Parse admin emails
 	adminEmailList := parseAdminEmails(cfg)
 
-	// 10b. Initialize plugin manager
-	pluginMgr := initPluginManager()
-	defer pluginMgr.Shutdown()
-
-	// 11. Start Hub
-	var hubSrv *hub.Server
+	// Initialize secret backend before plugin manager so that boot-time
+	// inline-secret migration can write to the backend before
+	// ResolvePluginConfig strips inline secrets.
 	var secretBackend secret.SecretBackend
-	var hubDBRec dbmetrics.Recorder
-	if enableHub {
-		// Initialize secret backend early so signing keys can be loaded from it
-		// during hub server creation. This prevents the previous bug where
-		// ensureSigningKey always fell through to SQLite because the secret
-		// backend was set too late (after hub.New()).
+	if enableHub && s != nil {
 		hubID := cfg.Hub.ResolveHubID()
 		var sbErr error
 		secretBackend, sbErr = secret.NewBackend(ctx, cfg.Secrets.Backend, s, secret.GCPBackendConfig{
@@ -237,6 +229,16 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 		if sbErr != nil {
 			log.Printf("Warning: failed to initialize secret backend: %v", sbErr)
 		}
+	}
+
+	// 10b. Initialize plugin manager
+	pluginMgr := initPluginManager(ctx, secretBackend)
+	defer pluginMgr.Shutdown()
+
+	// 11. Start Hub
+	var hubSrv *hub.Server
+	var hubDBRec dbmetrics.Recorder
+	if enableHub {
 
 		var hubInitErr error
 		hubSrv, hubInitErr = initHubServer(ctx, cfg, s, entClient, hubEndpoint, devAuthToken, adminEmailList, adminMode, maintenanceMessage, requestLogger, messageLogger, globalDir, pluginMgr, secretBackend)
@@ -410,10 +412,12 @@ func runServerStart(cmd *cobra.Command, args []string) error {
 					continue
 				}
 
-				// Inject hub credentials into hub-managed broker plugins so they
-				// can authenticate back to the Hub API. Self-managed plugins
-				// handle their own credential lifecycle.
-				if !pluginMgr.IsSelfManaged(scionplugin.PluginTypeBroker, bt) && hubSrv != nil && s != nil {
+				// Inject hub credentials into hub-managed, non-HA broker plugins.
+				// Self-managed plugins handle their own credential lifecycle;
+				// HA integrations pull credentials from env/Secret Manager.
+				if !pluginMgr.IsSelfManaged(scionplugin.PluginTypeBroker, bt) &&
+					pluginMgr.GetDeploymentMode(scionplugin.PluginTypeBroker, bt) != scionplugin.DeploymentModeHA &&
+					hubSrv != nil && s != nil {
 					// Use the same deterministic UUIDv5 as the α migration so the
 					// broker entity created here matches the migrated ID.
 					pluginBrokerNS := uuid.MustParse("5c104390-a1d0-5e9a-9b1e-5c104390a1d0")
@@ -2022,7 +2026,9 @@ func isObserverBroker(pluginMgr *scionplugin.Manager, name string) bool {
 }
 
 // initPluginManager creates and loads a plugin manager from versioned settings.
-func initPluginManager() *scionplugin.Manager {
+// The secretBackend parameter (may be nil) enables one-shot migration of inline
+// secrets to the backend before ResolvePluginConfig strips them.
+func initPluginManager(ctx context.Context, secretBackend secret.SecretBackend) *scionplugin.Manager {
 	logger := logging.Subsystem("plugin")
 	mgr := scionplugin.NewManager(logger)
 	mgr.NewGRPCBrokerAdapter = grpcbroker.NewAdapterFromEntry
@@ -2043,11 +2049,24 @@ func initPluginManager() *scionplugin.Manager {
 		Broker: make(map[string]scionplugin.PluginEntry),
 	}
 	for name, entry := range vs.Server.Plugins.Broker {
-		// Merge config_file contents with inline config (inline overrides file).
-		mergedConfig, mergeErr := config.LoadPluginConfigFile(entry.ConfigFile, entry.Config)
+		// B1: Auto-migrate inline secrets to the secret backend before
+		// ResolvePluginConfig strips them. This ensures existing users
+		// with bot_token in settings.yaml don't lose their credentials
+		// on upgrade.
+		if secretBackend != nil && entry.Config != nil {
+			migrateInlineSecrets(ctx, secretBackend, name, entry.Config)
+		}
+
+		mergedConfig, mergeErr := config.ResolvePluginConfig(entry.ConfigFile, entry.Config)
 		if mergeErr != nil {
 			log.Printf("Warning: failed to load config file for plugin %q: %v", name, mergeErr)
-			mergedConfig = entry.Config
+			mergedConfig = stripSecretKeys(entry.Config)
+		}
+		if entry.ConfigFile != "" {
+			if mergedConfig == nil {
+				mergedConfig = make(map[string]string)
+			}
+			mergedConfig["config_file"] = entry.ConfigFile
 		}
 		pluginsCfg.Broker[name] = scionplugin.PluginEntry{
 			Path:          entry.Path,
@@ -2217,6 +2236,59 @@ func resolveMaintenanceConfig(cfg *config.GlobalConfig) hub.MaintenanceConfig {
 	}
 
 	return mc
+}
+
+// migrateInlineSecrets performs a one-shot migration of secret config keys found
+// in the raw inline settings.yaml config into the secret backend. This prevents
+// existing users who followed the Telegram/Discord READMEs (which have
+// bot_token directly in settings.yaml) from losing their credentials when
+// ResolvePluginConfig strips inline secrets.
+func migrateInlineSecrets(ctx context.Context, sb secret.SecretBackend, pluginName string, inlineConfig map[string]string) {
+	mappings, ok := config.PluginSecretKeyMap[pluginName]
+	if !ok {
+		return
+	}
+
+	hubID := sb.HubID()
+	for _, m := range mappings {
+		val, has := inlineConfig[m.ConfigKey]
+		if !has || val == "" {
+			continue
+		}
+		existing, err := sb.Get(ctx, m.SecretKey, store.ScopeHub, hubID)
+		if err != nil {
+			log.Printf("Warning: failed to check secret backend for %s (plugin %q), skipping migration: %v", m.ConfigKey, pluginName, err)
+			continue
+		}
+		if existing != nil && existing.Value != "" {
+			continue
+		}
+		_, _, err = sb.Set(ctx, &secret.SetSecretInput{
+			Name:          m.SecretKey,
+			Value:         val,
+			SecretType:    secret.TypeVariable,
+			InjectionMode: "as_needed",
+			Scope:         store.ScopeHub,
+			ScopeID:       hubID,
+			Description:   fmt.Sprintf("Auto-migrated from inline config for plugin %s", pluginName),
+		})
+		if err != nil {
+			log.Printf("Warning: failed to migrate inline secret %s for plugin %q: %v", m.ConfigKey, pluginName, err)
+			continue
+		}
+		log.Printf("Migrated inline %s to secret backend for plugin %q — remove it from settings.yaml", m.ConfigKey, pluginName)
+	}
+}
+
+// stripSecretKeys returns a copy of the config map with all secret config keys removed.
+func stripSecretKeys(cfg map[string]string) map[string]string {
+	out := make(map[string]string, len(cfg))
+	for k, v := range cfg {
+		if !config.IsSecretConfigKey(k) {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // injectPluginSecrets loads chat integration secrets from the secret backend
