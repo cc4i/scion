@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/GoogleCloudPlatform/scion/pkg/messages"
@@ -311,7 +312,7 @@ func (h *CommandHandler) HandleAutocomplete(s *discordgo.Session, i *discordgo.I
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		link, err := h.store.GetChannelLink(ctx, i.ChannelID)
+		link, err := resolveChannelLink(ctx, s, h.store, i.ChannelID)
 		if err != nil || link == nil {
 			// No link — return empty choices.
 			_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
@@ -537,7 +538,7 @@ func (h *CommandHandler) HandleAgents(s *discordgo.Session, i *discordgo.Interac
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	link, err := h.store.GetChannelLink(ctx, i.ChannelID)
+	link, err := resolveChannelLink(ctx, s, h.store, i.ChannelID)
 	if err != nil {
 		h.log.Error("Failed to get channel link", "error", err, "channel_id", i.ChannelID)
 		h.followup(s, i, "Something went wrong. Please try again.")
@@ -611,7 +612,7 @@ func (h *CommandHandler) HandleInfo(s *discordgo.Session, i *discordgo.Interacti
 
 	// Show channel link if in a guild channel.
 	if i.ChannelID != "" {
-		link, linkErr := h.store.GetChannelLink(ctx, i.ChannelID)
+		link, linkErr := resolveChannelLink(ctx, s, h.store, i.ChannelID)
 		if linkErr == nil && link != nil {
 			sb.WriteString(fmt.Sprintf("\n**Channel project:** %s", link.ProjectSlug))
 			if link.DefaultAgent != "" {
@@ -634,7 +635,7 @@ func (h *CommandHandler) HandleStatus(s *discordgo.Session, i *discordgo.Interac
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	link, err := h.store.GetChannelLink(ctx, i.ChannelID)
+	link, err := resolveChannelLink(ctx, s, h.store, i.ChannelID)
 	if err != nil || link == nil {
 		h.followup(s, i, "This channel is not linked to a project. Use `/scion setup` first.")
 		return
@@ -693,12 +694,7 @@ func (h *CommandHandler) HandleMessage(s *discordgo.Session, i *discordgo.Intera
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	link, err := h.store.GetChannelLink(ctx, i.ChannelID)
-	if err != nil || link == nil {
-		if parentID := threadParentID(s, i.ChannelID); parentID != "" {
-			link, err = h.store.GetChannelLink(ctx, parentID)
-		}
-	}
+	link, err := resolveChannelLink(ctx, s, h.store, i.ChannelID)
 	if err != nil || link == nil {
 		h.followup(s, i, "This channel is not linked to a project. Use `/scion setup` first.")
 		return
@@ -800,7 +796,7 @@ func (h *CommandHandler) HandleDefault(s *discordgo.Session, i *discordgo.Intera
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	link, err := h.store.GetChannelLink(ctx, i.ChannelID)
+	link, err := resolveChannelLink(ctx, s, h.store, i.ChannelID)
 	if err != nil {
 		h.log.Error("Failed to get channel link", "error", err, "channel_id", i.ChannelID)
 		h.followup(s, i, "Something went wrong. Please try again.")
@@ -871,7 +867,7 @@ func (h *CommandHandler) HandleSettings(s *discordgo.Session, i *discordgo.Inter
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	link, err := h.store.GetChannelLink(ctx, i.ChannelID)
+	link, err := resolveChannelLink(ctx, s, h.store, i.ChannelID)
 	if err != nil {
 		h.log.Error("Failed to get channel link", "error", err, "channel_id", i.ChannelID)
 		h.followup(s, i, "Something went wrong. Please try again.")
@@ -1014,6 +1010,11 @@ func interactionUserID(i *discordgo.InteractionCreate) string {
 	return ""
 }
 
+var (
+	threadParentsMu sync.Mutex
+	threadParents   = make(map[string]string)
+)
+
 // threadParentID returns the parent channel ID if channelID is a thread,
 // or empty string if it is not a thread or the lookup fails.
 func threadParentID(s *discordgo.Session, channelID string) string {
@@ -1034,6 +1035,32 @@ func threadParentID(s *discordgo.Session, channelID string) string {
 		return ch.ParentID
 	}
 	return ""
+}
+
+// resolveChannelLink looks up a ChannelLink for channelID. If no active link
+// is found and the channel is a thread, it falls back to the parent channel.
+func resolveChannelLink(ctx context.Context, s *discordgo.Session, store Store, channelID string) (*ChannelLink, error) {
+	link, err := store.GetChannelLink(ctx, channelID)
+	if err != nil {
+		return nil, err
+	}
+	if link == nil || !link.Active {
+		threadParentsMu.Lock()
+		parentID, cached := threadParents[channelID]
+		threadParentsMu.Unlock()
+
+		if !cached {
+			parentID = threadParentID(s, channelID)
+			threadParentsMu.Lock()
+			threadParents[channelID] = parentID
+			threadParentsMu.Unlock()
+		}
+
+		if parentID != "" {
+			return store.GetChannelLink(ctx, parentID)
+		}
+	}
+	return link, nil
 }
 
 // activityEmoji returns an emoji for an agent activity state.
