@@ -35,8 +35,7 @@ skills_dir: .claude/skills
 interrupt_key: Escape
 interrupt_sequence:
   - Escape
-  - Escape
-  - Escape
+  - C-c
 interrupt_signal: sequence
 instructions_file: .claude/CLAUDE.md
 system_prompt_file: .claude/system-prompt.md
