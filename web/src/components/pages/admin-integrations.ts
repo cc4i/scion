@@ -75,8 +75,15 @@ function resolvePlatform(name: string): string {
 const PLATFORM_FIELDS: Record<string, PlatformFieldDef[]> = {
   telegram: [
     { key: 'inbound_mode', label: 'Inbound Mode', description: 'How Telegram delivers updates (poll or webhook)', defaultValue: 'poll' },
+    { key: 'webhook_url', label: 'Webhook URL', description: 'Public URL for Telegram to send webhook updates to', defaultValue: '' },
     { key: 'webhook_listen', label: 'Webhook Listen', description: 'HTTP listen address for webhook mode', defaultValue: ':9094' },
-    { key: 'db_path', label: 'Database Path', description: 'Path to SQLite database', defaultValue: '~/.scion/scion-telegram.db' },
+    { key: 'db_path', label: 'Database Path', description: 'Path to SQLite database', defaultValue: 'telegram_v2.db' },
+    { key: 'skip_set_webhook', label: 'Skip Webhook Registration', description: 'Set to true when running in HA mode to skip automatic webhook registration', defaultValue: 'false' },
+    { key: 'agent_cache_ttl', label: 'Agent Cache TTL', description: 'How long to cache agent info', defaultValue: '5m' },
+    { key: 'send_queue_size', label: 'Send Queue Size', description: 'Buffer size for outbound message queue (0 = unbuffered)', defaultValue: '0' },
+    { key: 'send_min_delay', label: 'Send Min Delay', description: 'Minimum delay between outbound messages (e.g. 100ms)', defaultValue: '' },
+    { key: 'chat_routes', label: 'Chat Routes', description: 'JSON map of Telegram chat IDs to topic patterns (v1 migration seeding only)', defaultValue: '' },
+    { key: 'user_mappings', label: 'User Mappings', description: 'JSON map of Telegram usernames to scion user IDs (v1 migration seeding only)', defaultValue: '' },
   ],
   discord: [
     { key: 'application_id', label: 'Application ID', description: 'Discord application ID for slash commands', defaultValue: '' },
