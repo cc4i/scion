@@ -18,6 +18,9 @@ While Scion is powered by coding agents, and can absolutely be used for multi-ag
 
 ### Scion Films
 
+<img height="200" alt="scion-films-poster" src="https://github.com/user-attachments/assets/51be1c80-4bb3-48ad-90e9-356aeffcb678" />
+
+
 The [Scion Films](https://films.scion-ai.dev/) project was an exploration in how to iterate and improve multi-agent orchestration, skills, and tools in a domain that is not as innate or "verifiable" as classic auto-research problems where a simple computable scoring metric was used. Instead, human viewer feedback and agent retrospectives were used to iterate across a series of "pilots" - for fun, we use agents to document the entire proces, and in the end, they used the same refined tools and process to make a documentary film.
 
 ### Relics of Athenaeum
