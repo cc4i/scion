@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -155,12 +156,74 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 			Attach: true,
 			Exec:   true,
 		},
-		Profiles: []BrokerProfile{
-			{Name: "default", Type: runtimeType, Available: true},
-		},
+		Profiles: s.buildInfoProfiles(runtimeType),
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// isLocalOnlyRuntime returns true for runtime types that require a local daemon
+// or hardware and cannot function in a hosted cloud environment.
+func isLocalOnlyRuntime(runtimeType string) bool {
+	switch runtimeType {
+	case "docker", "podman", "container":
+		return true
+	}
+	return false
+}
+
+// buildInfoProfiles enumerates configured profiles from effective settings.
+// Falls back to a single "default" profile when no profiles are configured.
+func (s *Server) buildInfoProfiles(defaultRuntimeType string) []BrokerProfile {
+	vs, _, err := config.LoadEffectiveSettings("")
+	if err != nil || len(vs.Profiles) == 0 {
+		return []BrokerProfile{
+			{Name: "default", Type: defaultRuntimeType, Available: true},
+		}
+	}
+
+	names := make([]string, 0, len(vs.Profiles))
+	for name := range vs.Profiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var profiles []BrokerProfile
+	for _, name := range names {
+		profileCfg := vs.Profiles[name]
+		rtType := profileCfg.Runtime
+		if rtType == "" {
+			rtType = defaultRuntimeType
+		}
+
+		if !isLocalOnlyRuntime(defaultRuntimeType) && isLocalOnlyRuntime(rtType) {
+			continue
+		}
+
+		var ctx, ns string
+		if vs.Runtimes != nil {
+			if rtCfg, ok := vs.Runtimes[rtType]; ok {
+				ctx = rtCfg.Context
+				ns = rtCfg.Namespace
+			}
+		}
+
+		profiles = append(profiles, BrokerProfile{
+			Name:      name,
+			Type:      rtType,
+			Available: true,
+			Context:   ctx,
+			Namespace: ns,
+		})
+	}
+
+	if len(profiles) == 0 {
+		return []BrokerProfile{
+			{Name: "default", Type: defaultRuntimeType, Available: true},
+		}
+	}
+
+	return profiles
 }
 
 // handleHubConnections returns live status of all hub connections.
