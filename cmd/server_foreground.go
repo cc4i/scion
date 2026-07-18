@@ -1904,7 +1904,7 @@ func startRuntimeBroker(ctx context.Context, cmd *cobra.Command, cfg *config.Glo
 			return fmt.Errorf("stateless Cloud Run broker requires a derivable broker ID: %w", deriveErr)
 		}
 	}
-	brokerID := resolveBrokerID(cfg, settings, vsBroker, globalDir, defaultBrokerID)
+	brokerID := resolveBrokerID(ctx, cfg, settings, vsBroker, globalDir, defaultBrokerID, s)
 
 	// Resolve broker name
 	brokerName := resolveBrokerName(cfg, settings, vsBroker)
@@ -2279,7 +2279,10 @@ func initPluginManager(ctx context.Context, secretBackend secret.SecretBackend) 
 var cloudRunLogicalBrokerNamespace = uuid.MustParse("c10f7a0a-6f03-5f9f-8d52-1d98b0fdb001")
 
 // resolveBrokerID determines the broker ID from various sources.
-func resolveBrokerID(cfg *config.GlobalConfig, settings *config.Settings, vsBroker *config.V1BrokerConfig, globalDir, defaultBrokerID string) string {
+// It checks (in order): versioned settings, legacy settings, global config,
+// deterministic Cloud Run ID, DB recovery (single embedded broker), and
+// finally generates a new UUID as a last resort.
+func resolveBrokerID(ctx context.Context, cfg *config.GlobalConfig, settings *config.Settings, vsBroker *config.V1BrokerConfig, globalDir, defaultBrokerID string, s store.Store) string {
 	var brokerID string
 	if vsBroker != nil && vsBroker.BrokerID != "" {
 		brokerID = vsBroker.BrokerID
@@ -2293,6 +2296,23 @@ func resolveBrokerID(cfg *config.GlobalConfig, settings *config.Settings, vsBrok
 		log.Printf("Using deterministic logical broker ID: %s", defaultBrokerID)
 		return defaultBrokerID
 	}
+
+	// Recover from DB: if exactly one embedded broker exists, reuse its ID.
+	if brokerID == "" && s != nil {
+		embedded, err := s.FindEmbeddedBroker(ctx)
+		if err != nil {
+			log.Printf("Warning: failed to query database for broker ID recovery: %v", err)
+		} else if embedded != nil {
+			brokerID = embedded.ID
+			log.Printf("NOTICE: recovered broker ID %s from database (single embedded broker)", brokerID)
+			// Persist so we don't re-recover on next boot (writes to both legacy
+			// hub.brokerId and versioned server.broker.broker_id via UpdateSetting).
+			if err := config.UpdateSetting(globalDir, "hub.brokerId", brokerID, true); err != nil {
+				log.Printf("Warning: failed to persist recovered broker ID to settings: %v", err)
+			}
+		}
+	}
+
 	if brokerID == "" {
 		brokerID = api.NewUUID()
 		if err := config.UpdateSetting(globalDir, "hub.brokerId", brokerID, true); err != nil {

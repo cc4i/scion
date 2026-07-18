@@ -174,6 +174,24 @@ type AgentStore interface {
 	// whose activity is not a terminal sticky state or already stalled/offline.
 	// Returns the updated agent records for event publishing.
 	MarkStalledAgents(ctx context.Context, activityThreshold, heartbeatRecency time.Time) ([]Agent, error)
+
+	// FindOrphanedAgents returns agents whose RuntimeBrokerID references a broker
+	// that is offline or does not exist, and who are not in terminal states
+	// (stopped, error). Agents assigned to the given currentBrokerID are excluded.
+	// This guards against reassigning agents that belong to active remote brokers
+	// in multi-broker setups.
+	FindOrphanedAgents(ctx context.Context, currentBrokerID string) ([]*Agent, error)
+
+	// ReassignAgentsToBroker bulk-updates the RuntimeBrokerID of the given agents
+	// to the specified broker ID. Returns the number of agents updated.
+	ReassignAgentsToBroker(ctx context.Context, agents []*Agent, brokerID string) (int, error)
+
+	// ReassignProjectBroker updates projects whose DefaultRuntimeBrokerID
+	// matches oldBrokerID to point to newBrokerID. Only projects whose current
+	// default broker is offline or missing are updated — projects pointing to
+	// active remote brokers are left untouched. Returns the number of projects
+	// updated.
+	ReassignProjectBroker(ctx context.Context, oldBrokerID, newBrokerID string) (int, error)
 }
 
 // AgentFilter defines criteria for filtering agents.
@@ -321,6 +339,12 @@ type RuntimeBrokerStore interface {
 	// ListRuntimeBrokers returns runtime brokers matching the filter criteria.
 	ListRuntimeBrokers(ctx context.Context, filter RuntimeBrokerFilter, opts ListOptions) (*ListResult[RuntimeBroker], error)
 
+	// FindEmbeddedBroker returns the single embedded broker if exactly one
+	// exists, or nil if zero or multiple embedded brokers are found (ambiguous).
+	// "Embedded" means the broker's labels contain {"scion.io/broker-role": "embedded"}.
+	// Used to recover broker ID from DB when settings are lost.
+	FindEmbeddedBroker(ctx context.Context) (*RuntimeBroker, error)
+
 	// UpdateRuntimeBrokerHeartbeat updates the last heartbeat and status.
 	UpdateRuntimeBrokerHeartbeat(ctx context.Context, id string, status string) error
 
@@ -353,6 +377,12 @@ type RuntimeBrokerStore interface {
 	// and whose connected_hub_id is not NULL (i.e. they still claim affinity).
 	// Returns the number of rows cleared. Does not change broker status.
 	ReapStaleBrokerAffinity(ctx context.Context, staleBefore time.Time) (cleared int, err error)
+
+	// MarkBrokerOffline sets a broker's status to offline. This is used during
+	// startup repair to ensure stale broker records that were never properly
+	// shut down are explicitly marked offline. Returns ErrNotFound if the
+	// broker doesn't exist. No-op if the broker is already offline.
+	MarkBrokerOffline(ctx context.Context, brokerID string) error
 }
 
 // RuntimeBrokerFilter defines criteria for filtering runtime brokers.
